@@ -5,6 +5,17 @@ const app = express();
 
 app.use(express.json());
 
+// Enable CORS for frontend requests
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.get('/', (req, res) => {
   return res.status(200).send({'message': 'SHIPTIVITY API. Read documentation to see API docs'});
 });
@@ -118,7 +129,7 @@ app.put('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
 
   let { status, priority } = req.body;
@@ -127,7 +138,72 @@ app.put('/api/v1/clients/:id', (req, res) => {
 
   /* ---------- Update code below ----------*/
 
+  const validStatuses = ['backlog', 'in-progress', 'complete'];
 
+  if (status !== undefined && status !== null) {
+    if (!validStatuses.includes(status)) {
+      return res.status(400).send({
+        'message': 'Invalid status provided.',
+        'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
+      });
+    }
+  }
+
+  if (priority !== undefined && priority !== null) {
+    priority = parseInt(priority, 10);
+    const { valid: priorityValid, messageObj: priorityMsg } = validatePriority(priority);
+    if (!priorityValid) {
+      return res.status(400).send(priorityMsg);
+    }
+  }
+
+  const targetStatus = status || client.status;
+
+  // Group clients by status and sort each group by priority ascending
+  const groups = {
+    'backlog': clients.filter(c => c.status === 'backlog').sort((a, b) => a.priority - b.priority),
+    'in-progress': clients.filter(c => c.status === 'in-progress').sort((a, b) => a.priority - b.priority),
+    'complete': clients.filter(c => c.status === 'complete').sort((a, b) => a.priority - b.priority),
+  };
+
+  // Remove client from their current status group
+  groups[client.status] = groups[client.status].filter(c => c.id !== client.id);
+
+  // Determine target priority
+  let targetPriority;
+  if (priority !== undefined && priority !== null) {
+    targetPriority = priority;
+  } else {
+    if (targetStatus === client.status) {
+      targetPriority = client.priority;
+    } else {
+      // If moving to different swimlane with no priority provided, insert as lowest priority (biggest number)
+      targetPriority = groups[targetStatus].length + 1;
+    }
+  }
+
+  // Clamp priority to valid range: 1 to (target group length + 1)
+  const maxPriority = groups[targetStatus].length + 1;
+  const finalPriority = Math.min(Math.max(1, targetPriority), maxPriority);
+
+  // Insert client into target group at the specified priority (1-indexed -> 0-indexed)
+  groups[targetStatus].splice(finalPriority - 1, 0, {
+    ...client,
+    status: targetStatus,
+  });
+
+  // Persist updated priorities and statuses to database in a transaction
+  const updateStmt = db.prepare('UPDATE clients SET status = ?, priority = ? WHERE id = ?');
+  const updateTransaction = db.transaction(() => {
+    for (const st of validStatuses) {
+      groups[st].forEach((c, index) => {
+        updateStmt.run(st, index + 1, c.id);
+      });
+    }
+  });
+  updateTransaction();
+
+  clients = db.prepare('select * from clients').all();
 
   return res.status(200).send(clients);
 });
